@@ -6,94 +6,88 @@ function doGet() {
 }
 
 /**
- * Main handler called by frontend.
- * 1. Exact Match Search
- * 2. Fuzzy Search if no exact match
- * 3. Returns status and candidates to frontend
+ * NEW: Uses People API to list contacts
  */
 function handleSearch(nameInput, dateString) {
-  var contacts = ContactsApp.getContacts(); // Note: Gets all contacts. Slow for 5k+ contacts, fine for personal use.
-  
   var searchName = nameInput.toLowerCase().trim();
+  
+  // Fetch contacts (max 1000 for simplicity) with necessary fields
+  try {
+    var response = People.People.Connections.list('people/me', {
+      personFields: 'names,birthdays,emailAddresses,organizations',
+      pageSize: 1000
+    });
+  } catch (e) {
+    return { status: 'ERROR', message: "API Error: " + e.message };
+  }
+
+  var connections = response.connections || [];
   var candidates = [];
   var exactMatches = [];
 
-  // 1. Iterate and Score
-  for (var i = 0; i < contacts.length; i++) {
-    var contact = contacts[i];
-    var cName = contact.getFullName();
-    var cNameLower = cName.toLowerCase();
+  for (var i = 0; i < connections.length; i++) {
+    var person = connections[i];
+    var pNameObj = person.names ? person.names[0] : null;
+    if (!pNameObj) continue;
+
+    var pName = pNameObj.displayName;
+    var pNameLower = pName.toLowerCase();
     
-    // Skip empty names
-    if (!cName) continue;
+    // Serialized contact object
+    var serialized = serializePerson(person);
 
     // Exact Match
-    if (cNameLower === searchName) {
-      exactMatches.push(serializeContact(contact));
+    if (pNameLower === searchName) {
+      exactMatches.push(serialized);
     } else {
       // Fuzzy Score
-      var dist = levenshtein(searchName, cNameLower);
-      // Threshold: Allow errors proportional to length, but max 5 distance
+      var dist = levenshtein(searchName, pNameLower);
       if (dist <= 5) {
-        candidates.push({
-          contact: serializeContact(contact),
-          score: dist
-        });
+        candidates.push({ contact: serialized, score: dist });
       }
     }
   }
 
-  // 2. Logic: Return Exact Matches first
-  if (exactMatches.length > 0) {
-    return { status: 'EXACT_MATCH', candidates: exactMatches };
-  }
-
-  // 3. Logic: If no exact, return top 5 fuzzy matches
+  if (exactMatches.length > 0) return { status: 'EXACT_MATCH', candidates: exactMatches };
+  
   if (candidates.length > 0) {
     candidates.sort(function(a, b) { return a.score - b.score; });
     var topCandidates = candidates.slice(0, 5).map(function(c) { return c.contact; });
     return { status: 'FUZZY_MATCH', candidates: topCandidates };
   }
 
-  // 4. No matches found
   return { status: 'NO_MATCH', candidates: [] };
 }
 
 /**
- * Helper to turn a Google Contact object into a simple JSON
+ * Helper: Maps People API Person object to our simple format
  */
-function serializeContact(contact) {
-  var emails = contact.getEmails().map(function(e) { return e.getAddress(); }).join(", ");
-  var companies = contact.getCompanies().map(function(c) { return c.getCompanyName(); }).join(", ");
+function serializePerson(person) {
+  var emails = person.emailAddresses ? person.emailAddresses.map(function(e) { return e.value; }).join(", ") : "";
+  var companies = person.organizations ? person.organizations.map(function(o) { return o.name; }).join(", ") : "";
   
-  // Get Birthday
-  var bdayDate = contact.getDates(ContactsApp.Field.BIRTHDAY)[0];
-  var bdayStr = null;
   var bdayObj = null;
+  var bdayStr = null;
 
-  if (bdayDate) {
-    // Note: getMonth() is 0-indexed in JS enum, but ContactsApp returns distinct Month enum.
-    // We strictly need the Day/Month/Year.
-    bdayObj = {
-      day: bdayDate.getDay(),
-      month: bdayDate.getMonth(), // Enum: JANUARY is usually mapped standardly
-      year: bdayDate.getYear() // Can be null
-    };
-    
-    // Formatting for display
-    var m = bdayDate.getMonth(); 
-    // Convert Enum to readable string if possible or map manually. 
-    // Easier hack: standard JS Date mapping
-    var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    // ContactsApp.Month.JANUARY is an Object, not an int. We need to parse strictly.
-    // Simpler approach for display:
-    bdayStr = months[Object.keys(ContactsApp.Month).indexOf(String(bdayDate.getMonth()))] + " " + bdayDate.getDay();
-    if (bdayDate.getYear()) bdayStr += ", " + bdayDate.getYear();
+  if (person.birthdays && person.birthdays.length > 0) {
+    var date = person.birthdays[0].date; // {year, month, day}
+    if (date) {
+      bdayObj = {
+        day: date.day,
+        month: date.month, // People API uses 1-based months (1 = Jan)
+        year: date.year // Can be undefined
+      };
+      
+      // Display String
+      var months = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      bdayStr = months[date.month] + " " + date.day;
+      if (date.year) bdayStr += ", " + date.year;
+    }
   }
 
   return {
-    id: contact.getId(),
-    name: contact.getFullName(),
+    id: person.resourceName, // Look like "people/c123456"
+    name: person.names[0].displayName,
     email: emails,
     company: companies,
     birthdayRaw: bdayObj,
@@ -102,75 +96,110 @@ function serializeContact(contact) {
 }
 
 /**
- * Called when user selects a specific contact to update
+ * Logic to Check/Update specific contact
  */
-function processSelectedContact(contactId, inputDateStr) {
-  var contact = ContactsApp.getContactById(contactId);
-  var existingDates = contact.getDates(ContactsApp.Field.BIRTHDAY);
-  var existing = existingDates.length > 0 ? existingDates[0] : null;
+function processSelectedContact(resourceName, inputDateStr) {
+  // 1. Fetch latest data for this person (need etag)
+  var person = People.People.get(resourceName, { personFields: 'birthdays,names' });
+  var inputParts = parseInputDate(inputDateStr); // {year, month, day}
 
-  // Parse Input Date (YYYY-MM-DD)
-  var parts = inputDateStr.split('-');
-  var inYear = parseInt(parts[0]);
-  var inMonth = getMonthEnum(parseInt(parts[1])); // Helper to get Enum
-  var inDay = parseInt(parts[2]);
-
-  // Case 1: No Existing Birthday -> Create
-  if (!existing) {
-    contact.addDate(ContactsApp.Field.BIRTHDAY, inMonth, inDay, inYear);
-    return { success: true, message: "Added birthday to " + contact.getFullName() };
+  var existingBirthdays = person.birthdays || [];
+  
+  // Case 1: No Existing Birthday -> Add
+  if (existingBirthdays.length === 0) {
+    return updatePersonBirthday(person, inputParts);
   }
 
-  // Case 2: Existing Birthday -> Compare
-  var exDay = existing.getDay();
-  var exMonth = existing.getMonth(); // This is an Enum
-  var exYear = existing.getYear();
+  // Case 2: Compare
+  var existing = existingBirthdays[0].date; // {year, month, day}
+  
+  var sameMonth = (existing.month === inputParts.month);
+  var sameDay = (existing.day === inputParts.day);
 
-  // Check Month/Day match
-  // We compare Enums by getting their string key or index. 
-  var monthMatch = (String(exMonth) == String(inMonth));
-  var dayMatch = (exDay == inDay);
-
-  if (monthMatch && dayMatch) {
-    if (!exYear) {
-      // Logic: Same day, missing year -> Update
-      existing.deleteDate(); // Delete old
-      contact.addDate(ContactsApp.Field.BIRTHDAY, inMonth, inDay, inYear); // Add new with year
-      return { success: true, message: "Updated existing birthday with Year " + inYear };
-    } else if (exYear == inYear) {
-      // Logic: Exact match -> Ignore
-      return { success: true, message: "Birthday already exact. No changes made." };
+  if (sameMonth && sameDay) {
+    if (!existing.year) {
+      // Missing year -> UPDATE to add year
+      return updatePersonBirthday(person, inputParts);
+    } else if (existing.year === inputParts.year) {
+      // Exact Match -> Ignore
+      return { success: true, message: "Birthday already exact. No changes." };
     } else {
-      // Logic: Different Year -> Error/Confirm
-      return { success: false, error: "CONFLICT", message: "Same day, but different year! Existing: " + exYear + ", Input: " + inYear };
+      // Different Year -> Conflict
+      return { success: false, error: "CONFLICT", message: "Same day, different year! Existing: " + existing.year + ", Input: " + inputParts.year };
     }
   } else {
-    // Logic: Totally different date -> Error/Confirm
-    return { success: false, error: "CONFLICT", message: "Conflict! Existing birthday is: " + formatEnum(exMonth) + " " + exDay };
+    // Different Date -> Conflict
+    return { success: false, error: "CONFLICT", message: "Conflict! Existing is " + existing.month + "/" + existing.day };
   }
 }
 
-function forceUpdate(contactId, inputDateStr) {
-   var contact = ContactsApp.getContactById(contactId);
-   // Clear all birthdays to be safe
-   var dates = contact.getDates(ContactsApp.Field.BIRTHDAY);
-   for (var i=0; i<dates.length; i++) dates[i].deleteDate();
+/**
+ * Force overwrite logic
+ */
+function forceUpdate(resourceName, inputDateStr) {
+  var person = People.People.get(resourceName, { personFields: 'birthdays' });
+  var inputParts = parseInputDate(inputDateStr);
+  return updatePersonBirthday(person, inputParts);
+}
 
-   var parts = inputDateStr.split('-');
-   contact.addDate(ContactsApp.Field.BIRTHDAY, getMonthEnum(parseInt(parts[1])), parseInt(parts[2]), parseInt(parts[0]));
-   return { success: true, message: "Force updated birthday." };
+/**
+ * Core Update Function using People API
+ */
+function updatePersonBirthday(person, dateParts) {
+  // Construct the resource to patch
+  var contactToUpdate = {
+    etag: person.etag, // REQUIRED for People API
+    birthdays: [{
+      date: {
+        year: dateParts.year,
+        month: dateParts.month,
+        day: dateParts.day
+      }
+    }]
+  };
+
+  try {
+    People.People.updateContact(person.resourceName, contactToUpdate, { updatePersonFields: 'birthdays' });
+    return { success: true, message: "Birthday updated successfully." };
+  } catch (e) {
+    return { success: false, message: "Error updating: " + e.message };
+  }
 }
 
 function createNewContact(name, dateStr) {
-  var parts = dateStr.split('-');
-  var contact = ContactsApp.createContact(name, "", "");
-  contact.addDate(ContactsApp.Field.BIRTHDAY, getMonthEnum(parseInt(parts[1])), parseInt(parts[2]), parseInt(parts[0]));
-  return { success: true, message: "Created new contact: " + name };
+  var parts = parseInputDate(dateStr);
+  
+  var contact = {
+    names: [{ givenName: name }],
+    birthdays: [{
+      date: {
+        year: parts.year,
+        month: parts.month,
+        day: parts.day
+      }
+    }]
+  };
+
+  try {
+    People.People.createContact(contact);
+    return { success: true, message: "Created new contact: " + name };
+  } catch(e) {
+    return { success: false, message: "Error creating: " + e.message };
+  }
 }
 
 // --- Utilities ---
 
-// Levenshtein Implementation
+function parseInputDate(dateStr) {
+  // Input is YYYY-MM-DD
+  var parts = dateStr.split('-');
+  return {
+    year: parseInt(parts[0]),
+    month: parseInt(parts[1]), // Input is 01-12, perfect for People API
+    day: parseInt(parts[2])
+  };
+}
+
 function levenshtein(a, b) {
   var tmp;
   if (a.length === 0) { return b.length; }
@@ -192,20 +221,4 @@ function levenshtein(a, b) {
     row[a.length] = prev;
   }
   return row[a.length];
-}
-
-function getMonthEnum(monthInt) {
-  var map = [
-    ContactsApp.Month.JANUARY, ContactsApp.Month.FEBRUARY, ContactsApp.Month.MARCH,
-    ContactsApp.Month.APRIL, ContactsApp.Month.MAY, ContactsApp.Month.JUNE,
-    ContactsApp.Month.JULY, ContactsApp.Month.AUGUST, ContactsApp.Month.SEPTEMBER,
-    ContactsApp.Month.OCTOBER, ContactsApp.Month.NOVEMBER, ContactsApp.Month.DECEMBER
-  ];
-  return map[monthInt - 1];
-}
-
-function formatEnum(enumVal) {
-   // Quick dirty map for display
-   var str = String(enumVal);
-   return str.substring(0,3); // JAN, FEB...
 }
