@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { font-family: sans-serif; padding: 20px; max-width: 500px; margin: 0 auto; background: #f4f4f4; }
+      .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+      input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+      button { width: 100%; padding: 12px; background: #4285f4; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-top: 10px; }
+      button:hover { background: #357abd; }
+      button.secondary { background: #999; }
+      .hidden { display: none; }
+      .list-item { padding: 10px; border-bottom: 1px solid #eee; cursor: pointer; }
+      .list-item:hover { background: #f0f8ff; }
+      .list-meta { font-size: 0.8em; color: #666; }
+      .error { color: #d93025; background: #fce8e6; padding: 10px; border-radius: 4px; margin-top: 10px; }
+      .success { color: #1e8e3e; background: #e6f4ea; padding: 10px; border-radius: 4px; margin-top: 10px; }
+      #loader { text-align: center; color: #666; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>🎂 Birthday Populator</h2>
+      
+      <div id="formView">
+        <label>Name</label>
+        <input type="text" id="nameInput" placeholder="e.g. John Doe">
+        <label>Birthday</label>
+        <input type="date" id="dateInput">
+        <button onclick="startSearch()">Search & Process</button>
+      </div>
+
+      <div id="listView" class="hidden">
+        <h3>Select Contact</h3>
+        <p>Found multiple matches. Click one to process.</p>
+        <div id="candidatesList"></div>
+        <button class="secondary" onclick="createNew()">None of these - Create New</button>
+        <button class="secondary" onclick="reset()">Cancel</button>
+      </div>
+
+      <div id="conflictView" class="hidden">
+        <h3>⚠️ Conflict Detected</h3>
+        <p id="conflictMsg"></p>
+        <button onclick="confirmOverwrite()">Overwrite Existing</button>
+        <button class="secondary" onclick="reset()">Cancel</button>
+      </div>
+
+      <div id="loader" class="hidden">Processing...</div>
+      <div id="messageArea"></div>
+    </div>
+
+    <script>
+      let currentCandidates = [];
+      let pendingId = null;
+
+      function startSearch() {
+        const name = document.getElementById('nameInput').value;
+        const date = document.getElementById('dateInput').value;
+        
+        if (!name || !date) {
+           showMessage("Please fill both fields.", "error");
+           return;
+        }
+
+        showLoader(true);
+        google.script.run.withSuccessHandler(handleSearchResults).handleSearch(name, date);
+      }
+
+      function handleSearchResults(response) {
+        showLoader(false);
+        const date = document.getElementById('dateInput').value;
+
+        if (response.status === 'EXACT_MATCH') {
+          // If exactly 1 match, auto-process. If > 1 exact match (John Doe duplicate), show list.
+          if (response.candidates.length === 1) {
+            processContact(response.candidates[0].id, date);
+          } else {
+            showCandidates(response.candidates);
+          }
+        } else if (response.status === 'FUZZY_MATCH') {
+          showCandidates(response.candidates);
+        } else {
+          // NO_MATCH -> Create New?
+          if(confirm("No contact found named '" + document.getElementById('nameInput').value + "'. Create new?")) {
+             createNew();
+          }
+        }
+      }
+
+      function showCandidates(list) {
+        document.getElementById('formView').classList.add('hidden');
+        document.getElementById('listView').classList.remove('hidden');
+        const container = document.getElementById('candidatesList');
+        container.innerHTML = '';
+
+        list.forEach(c => {
+          const div = document.createElement('div');
+          div.className = 'list-item';
+          div.innerHTML = `
+            <strong>${c.name}</strong>
+            <div class="list-meta">${c.email || 'No Email'} | ${c.company || 'No Company'}</div>
+            <div class="list-meta">Current Bday: ${c.birthdayDisplay || 'None'}</div>
+          `;
+          div.onclick = () => {
+             document.getElementById('listView').classList.add('hidden');
+             processContact(c.id, document.getElementById('dateInput').value);
+          };
+          container.appendChild(div);
+        });
+      }
+
+      function processContact(id, date) {
+        showLoader(true);
+        pendingId = id; // Store for potential conflict resolution
+        google.script.run.withSuccessHandler(handleUpdateResult).processSelectedContact(id, date);
+      }
+
+      function handleUpdateResult(res) {
+        showLoader(false);
+        if (res.success) {
+          showMessage(res.message, "success");
+          setTimeout(reset, 2000);
+        } else {
+          // Conflict
+          document.getElementById('formView').classList.add('hidden');
+          document.getElementById('conflictView').classList.remove('hidden');
+          document.getElementById('conflictMsg').innerText = res.message;
+        }
+      }
+
+      function confirmOverwrite() {
+        showLoader(true);
+        const date = document.getElementById('dateInput').value;
+        google.script.run.withSuccessHandler(handleUpdateResult).forceUpdate(pendingId, date);
+        document.getElementById('conflictView').classList.add('hidden');
+      }
+
+      function createNew() {
+        showLoader(true);
+        const name = document.getElementById('nameInput').value;
+        const date = document.getElementById('dateInput').value;
+        google.script.run.withSuccessHandler((res) => {
+           showLoader(false);
+           showMessage(res.message, "success");
+           setTimeout(reset, 2000);
+        }).createNewContact(name, date);
+      }
+
+      function reset() {
+        document.getElementById('formView').classList.remove('hidden');
+        document.getElementById('listView').classList.add('hidden');
+        document.getElementById('conflictView').classList.add('hidden');
+        document.getElementById('nameInput').value = '';
+        document.getElementById('dateInput').value = '';
+        document.getElementById('messageArea').innerHTML = '';
+        pendingId = null;
+      }
+
+      function showMessage(msg, type) {
+        const el = document.getElementById('messageArea');
+        el.innerHTML = `<div class="${type}">${msg}</div>`;
+      }
+
+      function showLoader(show) {
+        const loader = document.getElementById('loader');
+        if(show) loader.classList.remove('hidden');
+        else loader.classList.add('hidden');
+      }
+    </script>
+  </body>
+</html>
