@@ -5,14 +5,15 @@ function doGet() {
       .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
-/**
- * NEW: Uses People API to list contacts
- */
+// Reference: https://developers.google.com/people/api/rest/v1/
 function handleSearch(nameInput, dateString) {
+  //  Clean name input for searching
   var searchName = nameInput.toLowerCase().trim();
   
   // Fetch contacts (max 1000 for simplicity) with necessary fields
   try {
+    // Populate the array with Person objects with importantly names, birthdays, 
+    // email addresses, company is for when we have fuzzy searching
     var response = People.People.Connections.list('people/me', {
       personFields: 'names,birthdays,emailAddresses,organizations',
       pageSize: 1000
@@ -25,6 +26,7 @@ function handleSearch(nameInput, dateString) {
   var candidates = [];
   var exactMatches = [];
 
+  // 
   for (var i = 0; i < connections.length; i++) {
     var person = connections[i];
     var pNameObj = person.names ? person.names[0] : null;
